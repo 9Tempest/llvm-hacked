@@ -7,11 +7,14 @@
 //===----------------------------------------------------------------------===//
 
 #include "llvm/Transforms/Utils/HelloWorld.h"
-
+static int BBNum = 0;
 using namespace llvm;
 
 PreservedAnalyses HelloWorldPass::run(Function &F,
                                       FunctionAnalysisManager &AM) {
-  errs() << F.getName() << "\n";
+  for (BasicBlock &BB : F) {
+    BB.setName("BB_" + std::to_string(BBNum));
+    BBNum++;
+  }
   return PreservedAnalyses::all();
 }

@@ -127,6 +127,7 @@
 #include <utility>
 #include <vector>
 
+
 using namespace llvm;
 
 #define DEBUG_TYPE "asm-printer"
@@ -1597,13 +1598,44 @@ static bool needFuncLabels(const MachineFunction &MF) {
       classifyEHPersonality(MF.getFunction().getPersonalityFn()));
 }
 
+bool isUsedByTerminator(const llvm::MachineInstr &MI) {
+    const llvm::MachineBasicBlock *MBB = MI.getParent();
+    bool foundMI = false;
+
+    for (const llvm::MachineInstr &Instr : *MBB) {
+        // First, find MI in the basic block
+        if (&Instr == &MI) {
+            foundMI = true;
+            continue;
+        }
+
+        // Once MI is found, start checking subsequent instructions
+        if (foundMI) {
+            // Check if the instruction is a terminator
+            if (Instr.isTerminator()) {
+                // Check if any of the operands use the definition of MI
+                for (const auto &Op : Instr.operands()) {
+                    if (Op.isReg() && MI.definesRegister(Op.getReg()) && !Op.isKill()) {
+                        return true;
+                    }
+                }
+            } else {
+                // Check if any instruction between MI and the terminator kills the register
+                for (const auto &Op : Instr.operands()) {
+                    if (Op.isReg() && MI.definesRegister(Op.getReg()) && Op.isKill()) {
+                        return false;
+                    }
+                }
+            }
+        }
+    }
+
+    return false;
+}
+
 /// EmitFunctionBody - This method emits the body and trailer for a
 /// function.
 void AsmPrinter::emitFunctionBody() {
-  emitFunctionHeader();
-
-  // Emit target-specific gunk before the function body.
-  emitFunctionBodyStart();
 
   if (isVerbose()) {
     // Get MachineDominatorTree or compute it on the fly if it's unavailable
@@ -1629,130 +1661,159 @@ void AsmPrinter::emitFunctionBody() {
   bool IsEHa = MMI->getModule()->getModuleFlag("eh-asynch");
 
   bool CanDoExtraAnalysis = ORE->allowExtraAnalysis(DEBUG_TYPE);
-  for (auto &MBB : *MF) {
-    // Print a label for the basic block.
-    emitBasicBlockStart(MBB);
-    DenseMap<StringRef, unsigned> MnemonicCounts;
+  DenseMap<MachineBasicBlock*, bool> shouldSkipMBBs;
+  DenseMap<const BasicBlock*, SmallVector<MachineBasicBlock*>> BBtoMBBMap;
+  for (auto &MBB: *MF){
+    shouldSkipMBBs[&MBB] = false;
+    // skip if MBB is function entry
+    if (&MBB == &MF->front())
+      shouldSkipMBBs[&MBB] = true;
     for (auto &MI : MBB) {
-      // Print the assembly for the instruction.
-      if (!MI.isPosition() && !MI.isImplicitDef() && !MI.isKill() &&
-          !MI.isDebugInstr()) {
-        HasAnyRealCode = true;
-        ++NumInstsInFunction;
-      }
-
-      // If there is a pre-instruction symbol, emit a label for it here.
-      if (MCSymbol *S = MI.getPreInstrSymbol())
-        OutStreamer->emitLabel(S);
-
-      if (MDNode *MD = MI.getPCSections())
-        emitPCSectionsLabel(*MF, *MD);
-
-      for (const HandlerInfo &HI : Handlers) {
-        NamedRegionTimer T(HI.TimerName, HI.TimerDescription, HI.TimerGroupName,
-                           HI.TimerGroupDescription, TimePassesIsEnabled);
-        HI.Handler->beginInstruction(&MI);
-      }
-
-      if (isVerbose())
-        emitComments(MI, OutStreamer->getCommentOS());
-
-      switch (MI.getOpcode()) {
-      case TargetOpcode::CFI_INSTRUCTION:
-        emitCFIInstruction(MI);
-        break;
-      case TargetOpcode::LOCAL_ESCAPE:
-        emitFrameAlloc(MI);
-        break;
-      case TargetOpcode::ANNOTATION_LABEL:
-      case TargetOpcode::GC_LABEL:
-        OutStreamer->emitLabel(MI.getOperand(0).getMCSymbol());
-        break;
-      case TargetOpcode::EH_LABEL:
-        OutStreamer->emitLabel(MI.getOperand(0).getMCSymbol());
-        // For AsynchEH, insert a Nop if followed by a trap inst
-        //   Or the exception won't be caught.
-        //   (see MCConstantExpr::create(1,..) in WinException.cpp)
-        //  Ignore SDiv/UDiv because a DIV with Const-0 divisor
-        //    must have being turned into an UndefValue.
-        //  Div with variable opnds won't be the first instruction in
-        //  an EH region as it must be led by at least a Load
-        {
-          auto MI2 = std::next(MI.getIterator());
-          if (IsEHa && MI2 != MBB.end() &&
-              (MI2->mayLoadOrStore() || MI2->mayRaiseFPException()))
-            emitNops(1);
-        }
-        break;
-      case TargetOpcode::INLINEASM:
-      case TargetOpcode::INLINEASM_BR:
-        emitInlineAsm(&MI);
-        break;
-      case TargetOpcode::DBG_VALUE:
-      case TargetOpcode::DBG_VALUE_LIST:
-        if (isVerbose()) {
-          if (!emitDebugValueComment(&MI, *this))
-            emitInstruction(&MI);
-        }
-        break;
-      case TargetOpcode::DBG_INSTR_REF:
-        // This instruction reference will have been resolved to a machine
-        // location, and a nearby DBG_VALUE created. We can safely ignore
-        // the instruction reference.
-        break;
-      case TargetOpcode::DBG_PHI:
-        // This instruction is only used to label a program point, it's purely
-        // meta information.
-        break;
-      case TargetOpcode::DBG_LABEL:
-        if (isVerbose()) {
-          if (!emitDebugLabelComment(&MI, *this))
-            emitInstruction(&MI);
-        }
-        break;
-      case TargetOpcode::IMPLICIT_DEF:
-        if (isVerbose()) emitImplicitDef(&MI);
-        break;
-      case TargetOpcode::KILL:
-        if (isVerbose()) emitKill(&MI, *this);
-        break;
-      case TargetOpcode::PSEUDO_PROBE:
-        emitPseudoProbe(MI);
-        break;
-      case TargetOpcode::ARITH_FENCE:
-        if (isVerbose())
-          OutStreamer->emitRawComment("ARITH_FENCE");
-        break;
-      case TargetOpcode::MEMBARRIER:
-        OutStreamer->emitRawComment("MEMBARRIER");
-        break;
-      case TargetOpcode::JUMP_TABLE_DEBUG_INFO:
-        // This instruction is only used to note jump table debug info, it's
-        // purely meta information.
-        break;
-      default:
-        emitInstruction(&MI);
-        if (CanDoExtraAnalysis) {
-          MCInst MCI;
-          MCI.setOpcode(MI.getOpcode());
-          auto Name = OutStreamer->getMnemonic(MCI);
-          auto I = MnemonicCounts.insert({Name, 0u});
-          I.first->second++;
-        }
-        break;
-      }
-
-      // If there is a post-instruction symbol, emit a label for it here.
-      if (MCSymbol *S = MI.getPostInstrSymbol())
-        OutStreamer->emitLabel(S);
-
-      for (const HandlerInfo &HI : Handlers) {
-        NamedRegionTimer T(HI.TimerName, HI.TimerDescription, HI.TimerGroupName,
-                           HI.TimerGroupDescription, TimePassesIsEnabled);
-        HI.Handler->endInstruction();
-      }
+      // skip if MI is a call instruction
+      if (MI.isCall())
+        shouldSkipMBBs[&MBB] = true;
+      // skip if MI is a return instruction
+      if (MI.isReturn())
+        shouldSkipMBBs[&MBB] = true;
     }
 
+    // If MBB is not skipped, add it to BBtoMBBMap
+    if (!shouldSkipMBBs[&MBB] && MBB.getBasicBlock() != nullptr)
+      BBtoMBBMap[MBB.getBasicBlock()].push_back(&MBB);
+  }
+
+  for (auto &P : BBtoMBBMap) {
+    const BasicBlock *BB = P.first;
+    assert(BB != nullptr && "BasicBlock is null");
+    OutStreamer->addBlankLine();
+    OutStreamer->emitRawComment("@@@ " + Twine(BB->getName()), false);
+    for (auto &MBB_ptr : P.second){
+      auto &MBB = *MBB_ptr;
+      assert(!shouldSkipMBBs[&MBB] && "MBB in processed should not be skipped");
+          // Print a label for the basic block.
+      emitBasicBlockStart(MBB);
+      DenseMap<StringRef, unsigned> MnemonicCounts;
+      for (auto &MI : MBB) {
+        // Print the assembly for the instruction.
+        if (!MI.isPosition() && !MI.isImplicitDef() && !MI.isKill() &&
+            !MI.isDebugInstr()) {
+          HasAnyRealCode = true;
+          ++NumInstsInFunction;
+        }
+
+        // If there is a pre-instruction symbol, emit a label for it here.
+        if (MCSymbol *S = MI.getPreInstrSymbol())
+          OutStreamer->emitLabel(S);
+
+        if (MDNode *MD = MI.getPCSections())
+          emitPCSectionsLabel(*MF, *MD);
+
+        for (const HandlerInfo &HI : Handlers) {
+          NamedRegionTimer T(HI.TimerName, HI.TimerDescription, HI.TimerGroupName,
+                            HI.TimerGroupDescription, TimePassesIsEnabled);
+          HI.Handler->beginInstruction(&MI);
+        }
+
+        if (isVerbose())
+          emitComments(MI, OutStreamer->getCommentOS());
+
+        switch (MI.getOpcode()) {
+        case TargetOpcode::CFI_INSTRUCTION:
+          // emitCFIInstruction(MI);
+          break;
+        case TargetOpcode::LOCAL_ESCAPE:
+          // emitFrameAlloc(MI);
+          break;
+        case TargetOpcode::ANNOTATION_LABEL:
+        case TargetOpcode::GC_LABEL:
+          // OutStreamer->emitLabel(MI.getOperand(0).getMCSymbol());
+          break;
+        case TargetOpcode::EH_LABEL:
+          // OutStreamer->emitLabel(MI.getOperand(0).getMCSymbol());
+          // For AsynchEH, insert a Nop if followed by a trap inst
+          //   Or the exception won't be caught.
+          //   (see MCConstantExpr::create(1,..) in WinException.cpp)
+          //  Ignore SDiv/UDiv because a DIV with Const-0 divisor
+          //    must have being turned into an UndefValue.
+          //  Div with variable opnds won't be the first instruction in
+          //  an EH region as it must be led by at least a Load
+          {
+            auto MI2 = std::next(MI.getIterator());
+            if (IsEHa && MI2 != MBB.end() &&
+                (MI2->mayLoadOrStore() || MI2->mayRaiseFPException()))
+              emitNops(1);
+          }
+          break;
+        case TargetOpcode::INLINEASM:
+        case TargetOpcode::INLINEASM_BR:
+          emitInlineAsm(&MI);
+          break;
+        case TargetOpcode::DBG_VALUE:
+        case TargetOpcode::DBG_VALUE_LIST:
+          if (isVerbose()) {
+            if (!emitDebugValueComment(&MI, *this))
+              emitInstruction(&MI);
+          }
+          break;
+        case TargetOpcode::DBG_INSTR_REF:
+          // This instruction reference will have been resolved to a machine
+          // location, and a nearby DBG_VALUE created. We can safely ignore
+          // the instruction reference.
+          break;
+        case TargetOpcode::DBG_PHI:
+          // This instruction is only used to label a program point, it's purely
+          // meta information.
+          break;
+        case TargetOpcode::DBG_LABEL:
+          if (isVerbose()) {
+            if (!emitDebugLabelComment(&MI, *this))
+              emitInstruction(&MI);
+          }
+          break;
+        case TargetOpcode::IMPLICIT_DEF:
+          if (isVerbose()) emitImplicitDef(&MI);
+          break;
+        case TargetOpcode::KILL:
+          if (isVerbose()) emitKill(&MI, *this);
+          break;
+        case TargetOpcode::PSEUDO_PROBE:
+          // emitPseudoProbe(MI);
+          break;
+        case TargetOpcode::ARITH_FENCE:
+          if (isVerbose())
+            OutStreamer->emitRawComment("ARITH_FENCE");
+          break;
+        case TargetOpcode::MEMBARRIER:
+          OutStreamer->emitRawComment("MEMBARRIER");
+          break;
+        case TargetOpcode::JUMP_TABLE_DEBUG_INFO:
+          // This instruction is only used to note jump table debug info, it's
+          // purely meta information.
+          break;
+        default:
+          if (!MI.isTerminator() && !isUsedByTerminator(MI)){
+            emitInstruction(&MI);
+            if (CanDoExtraAnalysis) {
+              MCInst MCI;
+              MCI.setOpcode(MI.getOpcode());
+              auto Name = OutStreamer->getMnemonic(MCI);
+              auto I = MnemonicCounts.insert({Name, 0u});
+              I.first->second++;
+            }
+          }
+          break;
+        }
+
+        // If there is a post-instruction symbol, emit a label for it here.
+        if (MCSymbol *S = MI.getPostInstrSymbol())
+          OutStreamer->emitLabel(S);
+
+        for (const HandlerInfo &HI : Handlers) {
+          NamedRegionTimer T(HI.TimerName, HI.TimerDescription, HI.TimerGroupName,
+                            HI.TimerGroupDescription, TimePassesIsEnabled);
+          HI.Handler->endInstruction();
+        }
+      }
     // We must emit temporary symbol for the end of this basic block, if either
     // we have BBLabels enabled or if this basic blocks marks the end of a
     // section.
@@ -1807,6 +1868,7 @@ void AsmPrinter::emitFunctionBody() {
       }
       ORE->emit(R);
     }
+    }
   }
 
   EmittedInsts += NumInstsInFunction;
@@ -1837,126 +1899,8 @@ void AsmPrinter::emitFunctionBody() {
       emitNops(1);
     }
   }
-
-  // Switch to the original section in case basic block sections was used.
-  OutStreamer->switchSection(MF->getSection());
-
-  const Function &F = MF->getFunction();
-  for (const auto &BB : F) {
-    if (!BB.hasAddressTaken())
-      continue;
-    MCSymbol *Sym = GetBlockAddressSymbol(&BB);
-    if (Sym->isDefined())
-      continue;
-    OutStreamer->AddComment("Address of block that was removed by CodeGen");
-    OutStreamer->emitLabel(Sym);
-  }
-
-  // Emit target-specific gunk after the function body.
-  emitFunctionBodyEnd();
-
-  // Even though wasm supports .type and .size in general, function symbols
-  // are automatically sized.
-  bool EmitFunctionSize = MAI->hasDotTypeDotSizeDirective() && !TT.isWasm();
-
-  if (needFuncLabels(*MF) || EmitFunctionSize) {
-    // Create a symbol for the end of function.
-    CurrentFnEnd = createTempSymbol("func_end");
-    OutStreamer->emitLabel(CurrentFnEnd);
-  }
-
-  // If the target wants a .size directive for the size of the function, emit
-  // it.
-  if (EmitFunctionSize) {
-    // We can get the size as difference between the function label and the
-    // temp label.
-    const MCExpr *SizeExp = MCBinaryExpr::createSub(
-        MCSymbolRefExpr::create(CurrentFnEnd, OutContext),
-        MCSymbolRefExpr::create(CurrentFnSymForSize, OutContext), OutContext);
-    OutStreamer->emitELFSize(CurrentFnSym, SizeExp);
-    if (CurrentFnBeginLocal)
-      OutStreamer->emitELFSize(CurrentFnBeginLocal, SizeExp);
-  }
-
-  // Call endBasicBlockSection on the last block now, if it wasn't already
-  // called.
-  if (!MF->back().isEndSection()) {
-    for (const HandlerInfo &HI : Handlers) {
-      NamedRegionTimer T(HI.TimerName, HI.TimerDescription, HI.TimerGroupName,
-                         HI.TimerGroupDescription, TimePassesIsEnabled);
-      HI.Handler->endBasicBlockSection(MF->back());
-    }
-  }
-  for (const HandlerInfo &HI : Handlers) {
-    NamedRegionTimer T(HI.TimerName, HI.TimerDescription, HI.TimerGroupName,
-                       HI.TimerGroupDescription, TimePassesIsEnabled);
-    HI.Handler->markFunctionEnd();
-  }
-
-  MBBSectionRanges[MF->front().getSectionIDNum()] =
-      MBBSectionRange{CurrentFnBegin, CurrentFnEnd};
-
-  // Print out jump tables referenced by the function.
-  emitJumpTableInfo();
-
-  // Emit post-function debug and/or EH information.
-  for (const HandlerInfo &HI : Handlers) {
-    NamedRegionTimer T(HI.TimerName, HI.TimerDescription, HI.TimerGroupName,
-                       HI.TimerGroupDescription, TimePassesIsEnabled);
-    HI.Handler->endFunction(MF);
-  }
-
-  // Emit section containing BB address offsets and their metadata, when
-  // BB labels are requested for this function. Skip empty functions.
-  if (MF->hasBBLabels() && HasAnyRealCode)
-    emitBBAddrMapSection(*MF);
-
-  // Emit sections containing instruction and function PCs.
-  emitPCSections(*MF);
-
-  // Emit section containing stack size metadata.
-  emitStackSizeSection(*MF);
-
-  // Emit .su file containing function stack size information.
-  emitStackUsage(*MF);
-
-  emitPatchableFunctionEntries();
-
-  if (isVerbose())
-    OutStreamer->getCommentOS() << "-- End function\n";
-
   OutStreamer->addBlankLine();
 
-  // Output MBB ids, function names, and frequencies if the flag to dump
-  // MBB profile information has been set
-  if (MBBProfileDumpFileOutput && !MF->empty() &&
-      MF->getFunction().getEntryCount()) {
-    if (!MF->hasBBLabels())
-      MF->getContext().reportError(
-          SMLoc(),
-          "Unable to find BB labels for MBB profile dump. -mbb-profile-dump "
-          "must be called with -basic-block-sections=labels");
-    MachineBlockFrequencyInfo &MBFI =
-        getAnalysis<LazyMachineBlockFrequencyInfoPass>().getBFI();
-    // The entry count and the entry basic block frequency aren't the same. We
-    // want to capture "absolute" frequencies, i.e. the frequency with which a
-    // MBB is executed when the program is executed. From there, we can derive
-    // Function-relative frequencies (divide by the value for the first MBB).
-    // We also have the information about frequency with which functions
-    // were called. This helps, for example, in a type of integration tests
-    // where we want to cross-validate the compiler's profile with a real
-    // profile.
-    // Using double precision because uint64 values used to encode mbb
-    // "frequencies" may be quite large.
-    const double EntryCount =
-        static_cast<double>(MF->getFunction().getEntryCount()->getCount());
-    for (const auto &MBB : *MF) {
-      const double MBBRelFreq = MBFI.getBlockFreqRelativeToEntryBlock(&MBB);
-      const double AbsMBBFreq = MBBRelFreq * EntryCount;
-      *MBBProfileDumpFileOutput.get()
-          << MF->getName() << "," << MBB.getBBID() << "," << AbsMBBFreq << "\n";
-    }
-  }
 }
 
 /// Compute the number of Global Variables that uses a Constant.

@@ -72,21 +72,21 @@ bool X86AsmPrinter::runOnMachineFunction(MachineFunction &MF) {
 
   SetupMachineFunction(MF);
 
-  if (Subtarget->isTargetCOFF()) {
-    bool Local = MF.getFunction().hasLocalLinkage();
-    OutStreamer->beginCOFFSymbolDef(CurrentFnSym);
-    OutStreamer->emitCOFFSymbolStorageClass(
-        Local ? COFF::IMAGE_SYM_CLASS_STATIC : COFF::IMAGE_SYM_CLASS_EXTERNAL);
-    OutStreamer->emitCOFFSymbolType(COFF::IMAGE_SYM_DTYPE_FUNCTION
-                                    << COFF::SCT_COMPLEX_TYPE_SHIFT);
-    OutStreamer->endCOFFSymbolDef();
-  }
+  // if (Subtarget->isTargetCOFF()) {
+  //   bool Local = MF.getFunction().hasLocalLinkage();
+  //   OutStreamer->beginCOFFSymbolDef(CurrentFnSym);
+  //   OutStreamer->emitCOFFSymbolStorageClass(
+  //       Local ? COFF::IMAGE_SYM_CLASS_STATIC : COFF::IMAGE_SYM_CLASS_EXTERNAL);
+  //   OutStreamer->emitCOFFSymbolType(COFF::IMAGE_SYM_DTYPE_FUNCTION
+  //                                   << COFF::SCT_COMPLEX_TYPE_SHIFT);
+  //   OutStreamer->endCOFFSymbolDef();
+  // }
 
   // Emit the rest of the function body.
   emitFunctionBody();
 
   // Emit the XRay table for this function.
-  emitXRayTable();
+  // emitXRayTable();
 
   EmitFPOData = false;
 
@@ -438,19 +438,7 @@ static bool isIndirectBranchOrTailCall(const MachineInstr &MI) {
 }
 
 void X86AsmPrinter::emitBasicBlockEnd(const MachineBasicBlock &MBB) {
-  if (Subtarget->hardenSlsRet() || Subtarget->hardenSlsIJmp()) {
-    auto I = MBB.getLastNonDebugInstr();
-    if (I != MBB.end()) {
-      if ((Subtarget->hardenSlsRet() && isSimpleReturn(*I)) ||
-          (Subtarget->hardenSlsIJmp() && isIndirectBranchOrTailCall(*I))) {
-        MCInst TmpInst;
-        TmpInst.setOpcode(X86::INT3);
-        EmitToStreamer(*OutStreamer, TmpInst);
-      }
-    }
-  }
-  AsmPrinter::emitBasicBlockEnd(MBB);
-  SMShadowTracker.emitShadowPadding(*OutStreamer, getSubtargetInfo());
+  OutStreamer->emitRawComment("@@@EOB", false);
 }
 
 void X86AsmPrinter::PrintMemReference(const MachineInstr *MI, unsigned OpNo,
