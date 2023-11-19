@@ -1598,41 +1598,6 @@ static bool needFuncLabels(const MachineFunction &MF) {
       classifyEHPersonality(MF.getFunction().getPersonalityFn()));
 }
 
-bool isUsedByTerminator(const llvm::MachineInstr &MI) {
-    const llvm::MachineBasicBlock *MBB = MI.getParent();
-    bool foundMI = false;
-
-    for (const llvm::MachineInstr &Instr : *MBB) {
-        // First, find MI in the basic block
-        if (&Instr == &MI) {
-            foundMI = true;
-            continue;
-        }
-
-        // Once MI is found, start checking subsequent instructions
-        if (foundMI) {
-            // Check if the instruction is a terminator
-            if (Instr.isTerminator()) {
-                // Check if any of the operands use the definition of MI
-                for (const auto &Op : Instr.operands()) {
-                    if (Op.isReg() && MI.definesRegister(Op.getReg()) && !Op.isKill()) {
-                        return true;
-                    }
-                }
-            } else {
-                // Check if any instruction between MI and the terminator kills the register
-                for (const auto &Op : Instr.operands()) {
-                    if (Op.isReg() && MI.definesRegister(Op.getReg()) && Op.isKill()) {
-                        return false;
-                    }
-                }
-            }
-        }
-    }
-
-    return false;
-}
-
 /// EmitFunctionBody - This method emits the body and trailer for a
 /// function.
 void AsmPrinter::emitFunctionBody() {
@@ -1791,7 +1756,7 @@ void AsmPrinter::emitFunctionBody() {
           // purely meta information.
           break;
         default:
-          if (!MI.isTerminator() && !isUsedByTerminator(MI)){
+          if (!MI.isTerminator()){
             emitInstruction(&MI);
             if (CanDoExtraAnalysis) {
               MCInst MCI;
